@@ -63,6 +63,7 @@ $report       = in_array(get_str('report','recent'), ['recent','incomplete']) ? 
 $courseid     = get_int('courseid', 0);            // REQUIRED; no sensible default
 $cohortid     = get_int('cohortid', 0);            // Optional; 0 = all visible cohorts
 $since_days   = max(1, get_int('since_days', 30)); // For Recent report
+$years_back   = max(1, get_int('years_back', 1)); // For Not Completed
 $q            = get_str('q', '');                  // Client-side search box
 $manager_userid = get_int('manager_userid', 0);    // Admin-only filter
 
@@ -108,6 +109,8 @@ if ($isAdmin) {
     JOIN mdl_role_assignments ra ON ra.userid = u.id AND ra.roleid = :rid
     JOIN mdl_cohort_members cm ON cm.userid = u.id
     JOIN mdl_cohort ch ON ch.id = cm.cohortid
+    JOIN mdl_context ctx ON ctx.id = ra.contextid
+         AND (ctx.contextlevel = 10 OR ctx.id = ch.contextid)
     ORDER BY u.lastname, u.firstname, ch.name
   ";
   $stmt = $pdo->prepare($sqlManagers);
@@ -134,6 +137,8 @@ if ($isAdmin) {
     FROM mdl_role_assignments ra
     JOIN mdl_cohort_members cm ON cm.userid = ra.userid
     JOIN mdl_cohort ch ON ch.id = cm.cohortid
+    JOIN mdl_context ctx ON ctx.id = ra.contextid
+         AND (ctx.contextlevel = 10 OR ctx.id = ch.contextid)
     WHERE ra.roleid = :rid AND ra.userid = :uid
     ORDER BY ch.name
   ";
@@ -156,8 +161,9 @@ if ($cohortid && !isset($allCohorts[$cohortid])) {
   $cohortid = 0; // fallback to all visible
 }
 
-// Compute cutoff timestamp for "recent"
+// Compute cutoff timestamps
 $since_ts = time() - ($since_days * 24 * 60 * 60);
+$year_cutoff_ts = time() - (int)round($years_back * 365.25 * 86400);
 
 // --- Query builders ---
 
@@ -211,7 +217,7 @@ function fetch_recent_enrollments(PDO $pdo, int $courseid, array $cohortIds, int
  * - Latest enrollment time per user for this course (for display)
  * - Only where completion time is NULL
  */
-function fetch_not_completed(PDO $pdo, int $courseid, array $cohortIds): array {
+function fetch_not_completed(PDO $pdo, int $courseid, array $cohortIds, int $year_cutoff_ts): array {
   if (empty($cohortIds)) return [];
   $in = implode(',', array_fill(0, count($cohortIds), '?'));
 
@@ -232,9 +238,10 @@ function fetch_not_completed(PDO $pdo, int $courseid, array $cohortIds): array {
     WHERE cm.cohortid IN ($in)
       AND (cc.timecompleted IS NULL)
     GROUP BY u.id, u.firstname, u.lastname, u.email, ch.id, ch.name
+    HAVING MAX(ue.timecreated) >= ?
     ORDER BY latest_enroll_ts DESC
   ";
-  $params = array_merge([$courseid, $courseid], array_values($cohortIds));
+  $params = array_merge([$courseid, $courseid], array_values($cohortIds), [$year_cutoff_ts]);
   $stmt = $pdo->prepare($sql);
   $stmt->execute($params);
   $rows = $stmt->fetchAll();
@@ -256,7 +263,7 @@ if ($cohortid) {
 
 // --- Fetch data for both reports (so switching tabs is instant) ---
 $recentRows = fetch_recent_enrollments($pdo, $courseid, $visibleCohortIds, $since_ts);
-$incompleteRows = fetch_not_completed($pdo, $courseid, $visibleCohortIds);
+$incompleteRows = fetch_not_completed($pdo, $courseid, $visibleCohortIds, $year_cutoff_ts);
 
 // --- Render ---
 $title = "Cohort Course Reports";
@@ -351,6 +358,11 @@ $title = "Cohort Course Reports";
         <input type="number" name="since_days" value="<?= (int)$since_days ?>" min="1">
       </div>
 
+      <div <?= $report==='incomplete' ? '' : "style='opacity:.6'" ?>>
+        <label>Years back (Not Completed)</label>
+        <input type="number" name="years_back" value="<?= (int)$years_back ?>" min="1">
+      </div>
+
       <div>
         <label>Search (client-side)</label>
         <input type="text" name="q" id="q" value="<?= htmlspecialchars($q) ?>" placeholder="Type to filter rowsâ€¦">
@@ -420,7 +432,7 @@ $title = "Cohort Course Reports";
       <!-- Not Completed -->
       <section id="incomplete" style="<?= $report==='incomplete'?'':'display:none' ?>">
         <div class="toolbar">
-          <div><span class="pill warn">Showing: Not Completed</span></div>
+          <div><span class="pill warn">Showing: Not Completed (enrolled within last <?= (int)$years_back ?> year<?= $years_back > 1 ? 's' : '' ?>)</span></div>
           <div class="muted right"><?= count($incompleteRows) ?> row(s)</div>
         </div>
         <div style="overflow:auto; max-height:65vh;">
