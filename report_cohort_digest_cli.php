@@ -33,6 +33,7 @@ list($options, $unrec) = cli_get_params(
         'noreply_userid'               => 493,
         'roleid_manager'               => 10,     // cohort manager role (per-cohort mode)
         'roleid_site_manager'          => 1,      // site-level Manager roleid
+        'min_interval_days'            => 0,
         'dryrun'                       => 0,
         'help'                         => 0,
     ],
@@ -48,8 +49,12 @@ if (!empty($options['help']) || empty($options['courseid'])) {
                                    [--manager_userid=123]
                                    [--site_context_manager_userid=7]
                                    [--roleid_manager=10] [--roleid_site_manager=1]
-                                   [--noreply_userid=493] [--dryrun=1]
+                                   [--noreply_userid=493] [--min_interval_days=30]
+                                   [--dryrun=1]
 
+Options:
+  --min_interval_days=N  Skip managers who were successfully emailed within the
+                         last N days (checks mdl_cohort_digest_log). 0 = no throttle.
 Modes are mutually exclusive: do not pass --manager_userid together with --site_context_manager_userid.
 Logs every attempt to mdl_cohort_digest_log.\n";
     exit(0);
@@ -63,6 +68,7 @@ $site_ctx_uid    = $options['site_context_manager_userid'] !== null ? (int)$opti
 $noreply_userid  = (int)$options['noreply_userid'];
 $ROLEID_MANAGER  = (int)$options['roleid_manager'];
 $ROLEID_SITE_MGR = (int)$options['roleid_site_manager'];
+$min_interval_days = max(0, (int)$options['min_interval_days']);
 $dryrun          = ((int)$options['dryrun'] === 1);
 
 // Guard: mutual exclusivity
@@ -82,6 +88,7 @@ function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
 function csv_escape($v){
     $v = (string)$v;
     $needs = (strpos($v,'"')!==false)||(strpos($v,',')!==false)||(strpos($v,"\n")!==false)||(strpos($v,"\r")!==false);
+    if (isset($v[0]) && in_array($v[0], ['=','+','-','@'], true)) { $needs = true; }
     $v = str_replace('"','""',$v);
     return $needs ? "\"$v\"" : $v;
 }
@@ -134,6 +141,14 @@ $updMgr = $hasManagerEmails
         ON DUPLICATE KEY UPDATE recent_lastsentdate=NOW(), all_lastsentdate=NOW()
      ")
   : null;
+
+// Throttle check: skip managers emailed within --min_interval_days
+$chkInterval = ($min_interval_days > 0)
+    ? $pdo->prepare("
+          SELECT MAX(sent_at) FROM mdl_cohort_digest_log
+          WHERE manager_userid = ? AND courseid = ? AND sent_ok = 1
+      ")
+    : null;
 
 // Queries
 function fetch_recent_enrollments(PDO $pdo, int $courseid, array $cohortIds, int $since_ts): array {
@@ -328,6 +343,19 @@ if ($site_ctx_uid !== null) {
     if (!is_site_context_manager_or_admin($site_ctx_uid, $ROLEID_SITE_MGR)) {
         cli_error("[ERROR] User {$site_ctx_uid} is not site admin and does not hold roleid={$ROLEID_SITE_MGR} at system context.\n", 1);
     }
+    // Throttle check
+    if ($chkInterval) {
+        $chkInterval->execute([$site_ctx_uid, $courseid]);
+        $lastSent = $chkInterval->fetchColumn();
+        if ($lastSent) {
+            $daysSince = floor((time() - strtotime($lastSent)) / 86400);
+            if ($daysSince < $min_interval_days) {
+                echo "[SKIP] User {$site_ctx_uid} was emailed {$daysSince} day(s) ago (min_interval={$min_interval_days}).\n";
+                exit(0);
+            }
+        }
+    }
+
     // Collect all cohorts
     [$allIds, $allMap] = get_all_cohorts($pdo);
     if (empty($allIds)) {
@@ -428,6 +456,8 @@ $sqlManagers = "
   JOIN mdl_role_assignments ra ON ra.userid = u.id AND ra.roleid = :rid
   JOIN mdl_cohort_members cm   ON cm.userid = u.id
   JOIN mdl_cohort ch           ON ch.id = cm.cohortid
+  JOIN mdl_context ctx ON ctx.id = ra.contextid
+       AND (ctx.contextlevel = 10 OR ctx.id = ch.contextid)
   ORDER BY u.lastname, u.firstname, ch.name
 ";
 $stmt = $pdo->prepare($sqlManagers);
@@ -453,11 +483,25 @@ if (empty($managers)){
     exit(0);
 }
 
-$sentCount = 0; $skippedNoCohorts = 0;
+$sentCount = 0; $skippedNoCohorts = 0; $skippedThrottle = 0;
 
 foreach ($managers as $mid => $m) {
     $cohortIds = array_map('intval', array_keys($m['cohorts']));
     if (empty($cohortIds)) { $skippedNoCohorts++; echo "[WARN] Manager {$m['name']} has no cohorts; skipping.\n"; continue; }
+
+    // Throttle check
+    if ($chkInterval) {
+        $chkInterval->execute([$mid, $courseid]);
+        $lastSent = $chkInterval->fetchColumn();
+        if ($lastSent) {
+            $daysSince = floor((time() - strtotime($lastSent)) / 86400);
+            if ($daysSince < $min_interval_days) {
+                $skippedThrottle++;
+                echo "[SKIP] {$m['name']} last emailed {$daysSince} day(s) ago (min_interval={$min_interval_days})\n";
+                continue;
+            }
+        }
+    }
 
     $recentRows     = fetch_recent_enrollments($pdo, $courseid, $cohortIds, $recent_cutoff_ts);
     $incompleteRows = fetch_not_completed($pdo, $courseid, $cohortIds, $year_cutoff_ts);
@@ -542,5 +586,5 @@ foreach ($managers as $mid => $m) {
     ]);
 }
 
-echo "[DONE] Sent/queued: {$sentCount}; Managers without cohorts: {$skippedNoCohorts}\n";
+echo "[DONE] Sent/queued: {$sentCount}; Skipped (no cohorts): {$skippedNoCohorts}; Skipped (throttled): {$skippedThrottle}\n";
 exit(0);
